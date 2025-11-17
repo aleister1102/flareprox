@@ -5,6 +5,7 @@ Redirect all traffic through Cloudflare Workers for any provided URL
 """
 
 import argparse
+import http.server
 import getpass
 import json
 import os
@@ -13,6 +14,9 @@ import requests
 import string
 import sys
 import time
+import subprocess
+import signal
+from urllib.parse import urlparse, parse_qs, quote
 from typing import Dict, List, Optional
 
 
@@ -981,13 +985,19 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="FlareProx - Simple URL Redirection via Cloudflare Workers")
 
     parser.add_argument("command", nargs='?',
-                       choices=["create", "list", "test", "cleanup", "help", "config"],
+                       choices=["create", "list", "test", "cleanup", "help", "config", "serve", "serve-stop", "serve-status"],
                        help="Command to execute")
 
     parser.add_argument("--url", help="Target URL")
     parser.add_argument("--method", default="GET", help="HTTP method (default: GET)")
     parser.add_argument("--count", type=int, default=1, help="Number of proxies to create (default: 1)")
     parser.add_argument("--config", help="Configuration file path")
+    parser.add_argument("--host", default="127.0.0.1", help="Local server host (serve)")
+    parser.add_argument("--port", type=int, default=8080, help="Local server port (serve)")
+    parser.add_argument("--daemon", action="store_true", help="Run server in background (serve)")
+    parser.add_argument("--foreground", action="store_true", help="Internal flag to run server loop")
+    parser.add_argument("--selection", choices=["random", "roundrobin"], default="random", help="Endpoint selection policy")
+    parser.add_argument("--timeout", type=float, default=30.0, help="Upstream worker timeout seconds")
 
     return parser
 
@@ -1006,7 +1016,10 @@ def show_help_message() -> None:
     print(f"  list      List all proxy endpoints")
     print(f"  test      Test proxy endpoints and show IP addresses")
     print(f"  cleanup   Delete all proxy endpoints")
-    print(f"  help      Show detailed help\n")
+    print(f"  help      Show detailed help")
+    print(f"  serve     Start local proxy server")
+    print(f"  serve-stop Stop local proxy server")
+    print(f"  serve-status Show server status\n")
     print(f"{'-' * 70}")
     print(f"Examples:")
     print(f"{'-' * 70}\n")
@@ -1014,6 +1027,162 @@ def show_help_message() -> None:
     print(f"  python3 flareprox.py create --count 2")
     print(f"  python3 flareprox.py test")
     print(f"  python3 flareprox.py test --url https://httpbin.org/ip\n")
+    print(f"  python3 flareprox.py serve --host 127.0.0.1 --port 8080")
+    print(f"  curl -s 'http://127.0.0.1:8080/?url=https://httpbin.org/ip'\n")
+
+def _load_or_sync_endpoints(fp: "FlareProx") -> List[Dict]:
+    endpoints = fp._load_endpoints()
+    if not endpoints:
+        endpoints = fp.sync_endpoints()
+    return endpoints
+
+def _choose_endpoint(endpoints: List[Dict], policy: str, state: Dict) -> Optional[str]:
+    if not endpoints:
+        return None
+    if policy == "roundrobin":
+        idx = state.get("idx", 0)
+        url = endpoints[idx % len(endpoints)].get("url")
+        state["idx"] = (idx + 1) % len(endpoints)
+        return url
+    return random.choice(endpoints).get("url")
+
+def _make_handler(context: Dict):
+    class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
+        server_version = "FlareProxLocal/1.0"
+
+        def _forward(self):
+            parsed = urlparse(self.path)
+            target = None
+            p = parsed.path
+            if p.startswith("/http://") or p.startswith("/https://"):
+                target = p[1:]
+            if not target:
+                qs = parse_qs(parsed.query)
+                u = qs.get("url", [None])[0]
+                if u:
+                    target = u
+            if not target:
+                hdr = self.headers.get("X-Target-URL")
+                if hdr:
+                    target = hdr
+
+            if not target:
+                body = json.dumps({"error": "No target URL specified"}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            worker = _choose_endpoint(context["endpoints"], context["policy"], context["state"])  # type: ignore
+            if not worker:
+                body = json.dumps({"error": "No worker endpoints available"}).encode()
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            upstream_url = f"{worker}?url={quote(target, safe='')}"
+
+            exclude = {"host", "connection", "proxy-connection", "keep-alive", "transfer-encoding", "upgrade"}
+            fwd_headers = {}
+            for k, v in self.headers.items():
+                if k.lower() in exclude:
+                    continue
+                fwd_headers[k] = v
+
+            data = None
+            if self.command not in ("GET", "HEAD"):
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                if length > 0:
+                    data = self.rfile.read(length)
+
+            try:
+                resp = requests.request(self.command, upstream_url, headers=fwd_headers, data=data, timeout=context["timeout"])  # type: ignore
+                content = resp.content
+                self.send_response(resp.status_code)
+                excluded_resp = {"transfer-encoding", "content-encoding"}
+                for k, v in resp.headers.items():
+                    if k.lower() in excluded_resp:
+                        continue
+                    if k.lower() == "content-length":
+                        continue
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                if content:
+                    self.wfile.write(content)
+            except requests.RequestException as e:
+                msg = json.dumps({"error": "Proxy request failed", "message": str(e)}).encode()
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(msg)))
+                self.end_headers()
+                self.wfile.write(msg)
+
+        def do_GET(self):
+            self._forward()
+
+        def do_HEAD(self):
+            self._forward()
+
+        def do_POST(self):
+            self._forward()
+
+        def do_PUT(self):
+            self._forward()
+
+        def do_DELETE(self):
+            self._forward()
+
+        def do_OPTIONS(self):
+            self._forward()
+
+    return ProxyRequestHandler
+
+def run_local_proxy(fp: "FlareProx", host: str, port: int, selection: str, timeout: float):
+    endpoints = _load_or_sync_endpoints(fp)
+    if not endpoints:
+        print("\n  ✗ No endpoints available. Create with 'python3 flareprox.py create'\n")
+        return
+    context = {"endpoints": endpoints, "policy": selection, "state": {}, "timeout": timeout}
+    handler = _make_handler(context)
+    server = http.server.ThreadingHTTPServer((host, port), handler)
+    try:
+        print(f"\n  ✓ Local proxy server listening on http://{host}:{port}\n")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+def _pid_path() -> str:
+    return os.path.join(os.getcwd(), "flareprox_server.pid")
+
+def _write_pid(pid: int):
+    with open(_pid_path(), "w") as f:
+        f.write(str(pid))
+
+def _read_pid() -> Optional[int]:
+    p = _pid_path()
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+def _remove_pid():
+    p = _pid_path()
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
 
 
 def show_config_help() -> None:
@@ -1147,6 +1316,35 @@ def main():
                 flareprox.cleanup_all()
             else:
                 print("\n  Cleanup cancelled.\n")
+        elif args.command == "serve":
+            if args.daemon and not args.foreground:
+                cmd = [sys.executable, os.path.abspath(__file__), "serve", "--host", str(args.host), "--port", str(args.port), "--selection", args.selection, "--timeout", str(args.timeout), "--foreground"]
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _write_pid(proc.pid)
+                print(f"\n  ✓ Server started in background (PID {proc.pid})\n")
+                return
+            run_local_proxy(flareprox, args.host, args.port, args.selection, args.timeout)
+        elif args.command == "serve-stop":
+            pid = _read_pid()
+            if not pid:
+                print("\n  ✗ No PID file found\n")
+                return
+            try:
+                os.kill(pid, signal.SIGTERM)
+                _remove_pid()
+                print("\n  ✓ Server stopped\n")
+            except Exception as e:
+                print(f"\n  ✗ Failed to stop server: {e}\n")
+        elif args.command == "serve-status":
+            pid = _read_pid()
+            if not pid:
+                print("\n  • Server not running\n")
+                return
+            try:
+                os.kill(pid, 0)
+                print(f"\n  ✓ Server running (PID {pid})\n")
+            except Exception:
+                print("\n  • PID file exists but process not running\n")
 
     except FlareProxError as e:
         print(f"\n  ✗ Error: {e}\n")
