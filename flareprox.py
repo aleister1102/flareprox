@@ -16,6 +16,8 @@ import sys
 import time
 import subprocess
 import signal
+import socket
+import select
 from urllib.parse import urlparse, parse_qs, quote
 from typing import Dict, List, Optional
 
@@ -1050,12 +1052,27 @@ def _make_handler(context: Dict):
     class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         server_version = "FlareProxLocal/1.0"
 
+        def log_message(self, format, *args):
+            pass
+
+        def _access_log(self, status: int, bytes_sent: int):
+            remote = self.client_address[0] if self.client_address else "-"
+            user = "-"
+            ts = time.strftime('%d/%b/%Y:%H:%M:%S %z', time.localtime())
+            req = self.requestline
+            referer = self.headers.get("Referer", "-")
+            ua = self.headers.get("User-Agent", "-")
+            line = f"{remote} - {user} [{ts}] \"{req}\" {status} {bytes_sent} \"{referer}\" \"{ua}\""
+            print(line, flush=True)
+
         def _forward(self):
             parsed = urlparse(self.path)
             target = None
             p = parsed.path
             if p.startswith("/http://") or p.startswith("/https://"):
                 target = p[1:]
+            if not target and parsed.scheme in ("http", "https") and parsed.netloc:
+                target = self.path
             if not target:
                 qs = parse_qs(parsed.query)
                 u = qs.get("url", [None])[0]
@@ -1073,6 +1090,7 @@ def _make_handler(context: Dict):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                self._access_log(400, len(body))
                 return
 
             worker = _choose_endpoint(context["endpoints"], context["policy"], context["state"])  # type: ignore
@@ -1083,6 +1101,7 @@ def _make_handler(context: Dict):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                self._access_log(503, len(body))
                 return
 
             upstream_url = f"{worker}?url={quote(target, safe='')}"
@@ -1115,6 +1134,7 @@ def _make_handler(context: Dict):
                 self.end_headers()
                 if content:
                     self.wfile.write(content)
+                self._access_log(resp.status_code, len(content))
             except requests.RequestException as e:
                 msg = json.dumps({"error": "Proxy request failed", "message": str(e)}).encode()
                 self.send_response(502)
@@ -1122,6 +1142,7 @@ def _make_handler(context: Dict):
                 self.send_header("Content-Length", str(len(msg)))
                 self.end_headers()
                 self.wfile.write(msg)
+                self._access_log(502, len(msg))
 
         def do_GET(self):
             self._forward()
@@ -1141,13 +1162,59 @@ def _make_handler(context: Dict):
         def do_OPTIONS(self):
             self._forward()
 
+        def do_CONNECT(self):
+            try:
+                host, port_str = self.path.split(":", 1)
+                port = int(port_str)
+            except Exception:
+                self.send_response(400)
+                self.end_headers()
+                self._access_log(400, 0)
+                return
+
+            try:
+                upstream = socket.create_connection((host, port), timeout=10)
+            except Exception:
+                self.send_response(502)
+                self.end_headers()
+                self._access_log(502, 0)
+                return
+
+            try:
+                self.connection.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                self.connection.setblocking(False)
+                upstream.setblocking(False)
+                sockets = [self.connection, upstream]
+                bytes_out = 0
+                while True:
+                    rlist, _, _ = select.select(sockets, [], sockets, 30)
+                    if not rlist:
+                        break
+                    for s in rlist:
+                        try:
+                            data = s.recv(8192)
+                            if not data:
+                                raise Exception("closed")
+                            if s is self.connection:
+                                upstream.sendall(data)
+                            else:
+                                self.connection.sendall(data)
+                                bytes_out += len(data)
+                        except Exception:
+                            upstream.close()
+                            self._access_log(200, bytes_out)
+                            return
+            finally:
+                try:
+                    upstream.close()
+                except Exception:
+                    pass
+            self._access_log(200, bytes_out)
+
     return ProxyRequestHandler
 
 def run_local_proxy(fp: "FlareProx", host: str, port: int, selection: str, timeout: float):
     endpoints = _load_or_sync_endpoints(fp)
-    if not endpoints:
-        print("\n  ✗ No endpoints available. Create with 'python3 flareprox.py create'\n")
-        return
     context = {"endpoints": endpoints, "policy": selection, "state": {}, "timeout": timeout}
     handler = _make_handler(context)
     server = http.server.ThreadingHTTPServer((host, port), handler)
